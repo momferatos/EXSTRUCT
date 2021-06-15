@@ -1,0 +1,11 @@
+*.exe
+*.mod
+*.o
+fstruct/
+gs.dat
+*.h5
+*.xmf
+struct.bin
+struct.in
+*.vtk
+*~
