@@ -9,3 +9,9 @@ struct.bin
 struct.in
 *.vtk
 *~
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
