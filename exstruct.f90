@@ -826,15 +826,15 @@ contains
 
   end subroutine translate_structures
 
-  subroutine read_hdf5_file(n1,n2,n3,field,filename)
+  subroutine read_hdf5_file(n1,n2,n3,field,filename, fieldname)
     use hdf5
     implicit none
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     integer(ik), intent(out)                             :: n1, n2, n3
     real(sp), dimension(:,:,:), allocatable, intent(out) :: field
-    character(len=*), intent(in)                         :: filename
+    character(len=*), intent(in)                         :: filename, fieldname
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    character(len=4), parameter :: dsetname = "diss"     ! Dataset name
+    character(len=16) :: dsetname     ! Dataset name
     integer(HID_T) :: file_id       ! File identifier
     integer(HID_T) :: dset_id       ! Dataset identifier
     integer(HID_T) :: space_id       ! Dataspace identifier
@@ -842,6 +842,8 @@ contains
     integer     ::   error ! Error flag    
     integer(HSIZE_T), dimension(3) :: data_dims
     integer(HSIZE_T), dimension(3) :: max_dims                  
+
+    dsetname = fieldname
 
     print '(3a)', 'reading file ', trim(filename), '...'
 
@@ -907,16 +909,17 @@ program exstruct
   character(256)                         :: path,fmt
   real(8), external                      :: omp_get_wtime
   integer(i2b),  dimension(:,:), pointer :: point_array
-  character(len=1024)                    :: fname, strdevs, strvolume
+  character(len=1024)                    :: fname, field_name,strdevs, strvolume
 
-  if(command_argument_count() /= 3) then
-     print '(a)', 'usage: exstruct filename sdevs volume'
+  if(command_argument_count() /= 4) then
+     print '(a)', 'usage: exstruct filename fieldname sdevs volume'
      stop
   endif
 
   call get_command_argument(1, fname)
-  call get_command_argument(2, strdevs)
-  call get_command_argument(3, strvolume)
+  call get_command_argument(2, field_name)
+  call get_command_argument(3, strdevs)
+  call get_command_argument(4, strvolume)
 
   read(strdevs, *, err=100) m
   read(strvolume, *, err=200) volume
@@ -930,7 +933,7 @@ program exstruct
      stop
   end if
   
-  call read_hdf5_file(n1,n2,n3,field,fname)
+  call read_hdf5_file(n1,n2,n3,field,fname,field_name)
 
   nnn = n1
   allocate(neigh(nnn**3,3))
