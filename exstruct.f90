@@ -100,17 +100,18 @@ module routines
 
 contains
 
-  function per(n)
+  function per(n, m)
     implicit none
-    integer(ik) :: per,n
+    integer(ik)             :: per
+    integer(ik), intent(in) :: n, m
 !!!!!!!!!!!!!!!!!!!!!!!!!!!
-    !Handles periodic boundaries
+    !Handles periodic boundaries: wrap index n into [1, m]
 !!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-    if(n==n1 + 1) then
+    if(n==m + 1) then
        per = 1
     else if(n==0) then
-       per = n1
+       per = m
     else
        per = n
     end if
@@ -510,7 +511,7 @@ contains
                   struct_ptr%crosses_i = .true.
                end if
 
-               if(center2==1 .and. jj==n1 .or. center2==n1 .and. jj==1) then
+               if(center2==1 .and. jj==n2 .or. center2==n2 .and. jj==1) then
                   struct_ptr%crosses_j = .true.
                end if
 
@@ -672,7 +673,7 @@ contains
                    struct_ptr%crosses_i = .true.
                 end if
 
-                if(center2==1 .and. jj==n1 .or. center2==n1 .and. jj==1) then
+                if(center2==1 .and. jj==n2 .or. center2==n2 .and. jj==1) then
                    struct_ptr%crosses_j = .true.
                 end if
 
@@ -833,7 +834,7 @@ contains
                 struct_ptr%crosses_i = .true.
              end if
 
-             if(center2==1 .and. jj==n1 .or. center2==n1 .and. jj==1) then
+             if(center2==1 .and. jj==n2 .or. center2==n2 .and. jj==1) then
                 struct_ptr%crosses_j = .true.
              end if
 
@@ -1019,7 +1020,7 @@ contains
        k = astruct%points(m,3)
        box = .false.
        do ii=1,3 ; do jj=1,3 ; do kk=1,3
-          box(ii,jj,kk) = refmask(per(i + ii - 2),per(j + jj - 2),per(k + kk - 2))
+          box(ii,jj,kk) = refmask(per(i+ii-2,n1),per(j+jj-2,n2),per(k+kk-2,n3))
        enddo; enddo ; enddo
        if (.not.all(box)) nsurf = nsurf + 1
     enddo
@@ -1390,12 +1391,15 @@ contains
       logical :: connected,cell
       integer(ik) :: i,j,ii,jj,iii,jjj
 
+      connected = .false.
+
       if(dim==1_ik) then
-         connected = .false.
-         !$omp parallel do private(ii,jj,iii,jjj,cell) shared(connected)
-         do i=1,n1
+         ! i-face: does the box(1,:,:) plane connect to box(n1,:,:)?
+         ! scan the (n2,n3) plane and wrap neighbours by n2,n3.
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
+         do i=1,n2
             if(connected) cycle
-            do j=1,n2
+            do j=1,n3
                if(connected) cycle
                cell=box(1,i,j)
                if(cell) then
@@ -1403,12 +1407,9 @@ contains
                      if(connected) cycle
                      do jj=j-1,j+1
                         if(connected) cycle
-                        iii = per(ii)
-                        jjj = per(jj)
-                        if(cell .and. box(n1,iii,jjj)) then
-                           connected = .true.
-                           !return
-                        end if
+                        iii = per(ii,n2)
+                        jjj = per(jj,n3)
+                        if(box(n1,iii,jjj)) connected = .true.
                      end do
                   end do
                end if
@@ -1416,11 +1417,12 @@ contains
          end do
          !$omp end parallel do
       else if(dim==2_ik) then
-         connected = .false.
-         !$omp parallel do private(ii,jj,iii,jjj,cell) shared(connected)
+         ! j-face: does box(:,1,:) connect to box(:,n2,:)?
+         ! scan the (n1,n3) plane and wrap neighbours by n1,n3.
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
          do i=1,n1
             if(connected) cycle
-            do j=1,n2
+            do j=1,n3
                if(connected) cycle
                cell=box(i,1,j)
                if(cell) then
@@ -1428,11 +1430,9 @@ contains
                      if(connected) cycle
                      do jj=j-1,j+1
                         if(connected) cycle
-                        iii = per(ii)
-                        jjj = per(jj)
-                        if(cell .and. box(iii,n2,jjj)) then
-                           connected = .true.
-                        end if
+                        iii = per(ii,n1)
+                        jjj = per(jj,n3)
+                        if(box(iii,n2,jjj)) connected = .true.
                      end do
                   end do
                end if
@@ -1440,8 +1440,9 @@ contains
          end do
          !$omp end parallel do
       else if(dim==3_ik) then
-         connected = .false.
-         !$omp parallel do private(ii,jj,iii,jjj,cell) shared(connected)
+         ! k-face: does box(:,:,1) connect to box(:,:,n3)?
+         ! scan the (n1,n2) plane and wrap neighbours by n1,n2.
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
          do i=1,n1
             if(connected) cycle
             do j=1,n2
@@ -1452,11 +1453,9 @@ contains
                      if(connected) cycle
                      do jj=j-1,j+1
                         if(connected) cycle
-                        iii = per(ii)
-                        jjj = per(jj)
-                        if(cell .and. box(iii,jjj,n3)) then
-                           connected = .true.
-                        end if
+                        iii = per(ii,n1)
+                        jjj = per(jj,n2)
+                        if(box(iii,jjj,n3)) connected = .true.
                      end do
                   end do
                end if
@@ -1531,7 +1530,7 @@ contains
     real(sp), dimension(:,:,:), allocatable, intent(out) :: field
     character(len=*), intent(in)                         :: filename
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    character(len=6), parameter :: dsetname = "diss"     ! Dataset name
+    character(len=4), parameter :: dsetname = "diss"     ! Dataset name
     integer(HID_T) :: file_id       ! File identifier
     integer(HID_T) :: dset_id       ! Dataset identifier
     integer(HID_T) :: space_id       ! Dataspace identifier
@@ -1579,7 +1578,11 @@ contains
     !Get data
     call h5dread_f(dset_id, H5T_NATIVE_REAL, field, data_dims, error)
 
-
+    ! Close the dataspace, dataset and file before closing the interface,
+    ! otherwise these handles leak.
+    call h5sclose_f(space_id, error)
+    call h5dclose_f(dset_id, error)
+    call h5fclose_f(file_id, error)
     call h5close_f(error)
 
     print '(a)', 'done.'
@@ -1621,8 +1624,8 @@ program exstruct
   call get_command_argument(3, strvolume)
 
 
-  read(strdevs, '(i)', err=100) m
-  read(strvolume, '(i)', err=200) volume
+  read(strdevs, *, err=100) m
+  read(strvolume, *, err=200) volume
   if(m <= 0_ik) then
      print '(a)', 'error: argument sdev should be a positive integer greater than zero.'
      stop
@@ -1895,7 +1898,9 @@ program exstruct
   stop
 
 100 print '(a)', 'error: argument sdev should be a positive integer greater than zero.'
+  stop
 200 print '(a)', 'error: argument volume should be a positive integer.'
+  stop
 
 contains
 
