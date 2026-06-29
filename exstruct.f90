@@ -118,34 +118,45 @@ contains
     !Calculate mean and standard deviation of a scalar field
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     integer(ik)                                     :: i,j,k
-    real(rk)                                        :: fac
+    real(dp)                                        :: smean, ssdev, fac
 
-    fac = real(n1 * n2 * n3,rk)**(-1)
+    ! Accumulate in double precision and divide once at the end. The field is
+    ! single precision and has n1*n2*n3 (~1e7-1e8) points: summing it in single
+    ! precision loses the running sum to roundoff once it dwarfs the individual
+    ! terms, biasing mean/sdev and hence the mean+m*sdev cutoff that defines the
+    ! structures.
+    fac = 1.0_dp / real(n1,dp) / real(n2,dp) / real(n3,dp)
 
-    mean = 0.0_rk
-    sdev = 0.0_rk
+    smean = 0.0_dp
 
-    !$omp parallel do reduction(+:mean)
+    !$omp parallel do reduction(+:smean)
     do k=1,n3
        do j=1,n2
           do i=1,n1
-             mean = mean + fac * field(i,j,k)
+             smean = smean + real(field(i,j,k),dp)
           end do
        end do
     end do
     !$omp end parallel do
 
-    !$omp parallel do reduction(+:sdev)
+    smean = smean * fac
+
+    ssdev = 0.0_dp
+
+    !$omp parallel do reduction(+:ssdev)
     do k=1,n3
        do j=1,n2
           do i=1,n1
-             sdev = sdev + fac * (field(i,j,k) - mean)**2
+             ssdev = ssdev + (real(field(i,j,k),dp) - smean)**2
           end do
        end do
     end do
     !$omp end parallel do
 
-    sdev = sqrt(sdev)
+    ssdev = sqrt(ssdev * fac)
+
+    mean = real(smean,rk)
+    sdev = real(ssdev,rk)
 
     return
 
@@ -384,6 +395,14 @@ contains
       implicit none
       logical, intent(out) :: lcond, lexit, lcycle
 
+      ! All three outputs must be defined on every path: they are intent(out)
+      ! (undefined on entry) and the caller tests lexit/lcycle immediately, so
+      ! leaving any unset means the flood fill exits or cycles on garbage and
+      ! connected structures get torn apart.
+      lcond  = .false.
+      lexit  = .false.
+      lcycle = .false.
+
       if(first<last) then
          first = first + 1
          ii = neigh(first,1)
@@ -396,11 +415,8 @@ contains
             intrv1%j = jj
             intrv1%k = kk
             lcond = .true.
-            lcycle = .true.
-         else
-            lcond = .false.
-            lcycle = .true.
          end if
+         lcycle = .true.
       else
          lexit = .true.
       end if
@@ -642,13 +658,10 @@ contains
     !Translate structures so that they are continuous and not disrupted by
     !periodic boundaries!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    logical, dimension(:,:,:), allocatable :: box,box2
-    logical, dimension(:,:), allocatable   :: tmp
+    logical, dimension(:,:,:), allocatable :: box
     integer(ik)                            :: m,i,j,k,n,step_i,step_j,step_k
 
-    allocate(box2(1:n1,1:n2,1:n3))
     allocate(box(1:n1,1:n2,1:n3))
-    allocate(tmp(1:n1,1:n2))
     struct_ptr => struct
 
     n = 0
@@ -799,26 +812,10 @@ contains
     subroutine rotate(dim)
       implicit none
       integer(ik), intent(IN) :: dim
-      box2 = box
-      if(dim==1) then
-         !$omp workshare
-         tmp(:,:) = box2(1,:,:)
-         box(1:n1 - 1,:,:) = box2(2:n1,:,:)
-         box(n1,:,:) = tmp(:,:)
-         !$omp end workshare
-      else if(dim==2) then
-         !$omp workshare
-         tmp(:,:) = box2(:,1,:)
-         box(:,1:n2 - 1,:) = box2(:,2:n2,:)
-         box(:,n2,:) = tmp(:,:)
-         !$omp end workshare
-      else if(dim==3) then
-         !$omp workshare
-         tmp(:,:) = box2(:,:,1)
-         box(:,:,1:n3 - 1) = box2(:,:,2:n3)
-         box(:,:,n3) = tmp(:,:)
-         !$omp end workshare
-      end if
+      ! Circular shift of the whole box by one cell along axis dim. cshift
+      ! handles any extents, so this is correct on non-cubic grids; the old
+      ! hand-rolled version reused a tmp plane of fixed shape (n1,n2).
+      box = cshift(box, 1, int(dim))
 
       return
 
@@ -834,33 +831,40 @@ contains
     real(sp), dimension(:,:,:), allocatable, intent(out) :: field
     character(len=*), intent(in)                         :: filename, fieldname
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    character(len=16) :: dsetname     ! Dataset name
     integer(HID_T) :: file_id       ! File identifier
     integer(HID_T) :: dset_id       ! Dataset identifier
     integer(HID_T) :: space_id       ! Dataspace identifier
     integer(HID_T) :: dtype_id       ! Dataspace identifier
-    integer     ::   error ! Error flag    
+    integer     ::   error ! Error flag
+    integer        :: rank
     integer(HSIZE_T), dimension(3) :: data_dims
-    integer(HSIZE_T), dimension(3) :: max_dims                  
-
-    dsetname = fieldname
+    integer(HSIZE_T), dimension(3) :: max_dims
 
     print '(3a)', 'reading file ', trim(filename), '...'
 
     ! Initialize FORTRAN interface.
 
     call h5open_f(error)
+    if(error < 0) stop 'error: could not initialise the HDF5 interface.'
 
-    ! Open an existing file.
+    ! Open an existing file read-only (we never write to it).
 
-    call h5fopen_f (filename, H5F_ACC_RDWR_F, file_id, error)
+    call h5fopen_f (trim(filename), H5F_ACC_RDONLY_F, file_id, error)
+    if(error < 0) stop 'error: could not open the HDF5 file (check the path).'
 
-    ! Open an existing dataset.
+    ! Open an existing dataset. trim() is essential: a blank-padded name does
+    ! not match the dataset and h5dopen_f then leaves field uninitialised, so
+    ! the structures would be extracted from garbage.
 
-    call h5dopen_f(file_id, dsetname, dset_id, error)
+    call h5dopen_f(file_id, trim(fieldname), dset_id, error)
+    if(error < 0) stop 'error: could not open the requested field (check fieldname).'
 
     !Get dataspace ID
     call h5dget_space_f(dset_id, space_id,error)
+
+    ! Reject anything that is not a 3D dataset rather than reading it scrambled.
+    call h5sget_simple_extent_ndims_f(space_id, rank, error)
+    if(error < 0 .or. rank /= 3) stop 'error: the field dataset is not 3-dimensional.'
 
     !Get dataspace dims
 
@@ -875,6 +879,7 @@ contains
 
     !Get data
     call h5dread_f(dset_id, H5T_NATIVE_REAL, field, data_dims, error)
+    if(error < 0) stop 'error: could not read the field data.'
 
     ! Close the dataspace, dataset and file before closing the interface,
     ! otherwise these handles leak.
@@ -909,34 +914,18 @@ program exstruct
   character(256)                         :: path,fmt
   real(8), external                      :: omp_get_wtime
   integer(i2b),  dimension(:,:), pointer :: point_array
-  character(len=1024)                    :: fname, field_name,strdevs, strvolume
+  character(len=1024)                    :: fname, field_name
+  logical                                :: args_ok
 
-  if(command_argument_count() /= 4) then
-     print '(a)', 'usage: exstruct filename fieldname sdevs volume'
-     stop
-  endif
+  call parse_args(fname, field_name, m, volume, args_ok)
+  if(.not. args_ok) stop
 
-  call get_command_argument(1, fname)
-  call get_command_argument(2, field_name)
-  call get_command_argument(3, strdevs)
-  call get_command_argument(4, strvolume)
-
-  read(strdevs, *, err=100) m
-  read(strvolume, *, err=200) volume
-  if(m <= 0_ik) then
-     print '(a)', 'error: argument sdev should be a positive integer greater than zero.'
-     stop
-  end if
-
-  if(volume < 0_ik) then
-     print '(a)', 'error: argument volume should be a positive integer.'
-     stop
-  end if
-  
   call read_hdf5_file(n1,n2,n3,field,fname,field_name)
 
-  nnn = n1
-  allocate(neigh(nnn**3,3))
+  ! Worst case the BFS queue holds every interval; intrv() caps each column at
+  ! n3/2 intervals, so this bound is valid for non-cubic grids too (and is
+  ! smaller than the old n1**3 for cubic ones).
+  allocate(neigh(n1 * n2 * (n3 / 2), 3))
   neigh = 0
   allocate(mask(n1,n2,n3))
 
@@ -969,6 +958,8 @@ program exstruct
   !$omp end parallel do
 
   call mean_sdev(n1,n2,n3,field,mean,sdev)
+
+  print '(a,3es13.5)', 'mean, sdev, cutoff: ', mean, sdev, mean + m * sdev
 
   !$omp parallel do
   do k=1,n3
@@ -1158,6 +1149,8 @@ program exstruct
         intrv_ptr => intrv_ptr%next
         deallocate(intrv_ptr2)
      end do
+     ! Drop the dangling head so nothing below dereferences freed memory.
+     nullify(struct_ptr%intrv)
      struct_ptr => struct_ptr%next
   end do
 
@@ -1172,7 +1165,7 @@ program exstruct
   open(985,file='struct.bin',form='unformatted',action='write')
   write(985) nstruct - 1
   struct_ptr => struct
-  do while(associated(struct_ptr) .and. associated(struct_ptr%intrv))
+  do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
      if(struct_ptr%npoints /= 0) then
         write(985) struct_ptr%npoints
         write(985) struct_ptr%points(1:struct_ptr%npoints,1:3)
@@ -1184,11 +1177,6 @@ program exstruct
 
   call output_structures
 
-  stop
-
-100 print '(a)', 'error: argument sdev should be a positive integer greater than zero.'
-  stop
-200 print '(a)', 'error: argument volume should be a positive integer.'
   stop
 
 contains
@@ -1208,5 +1196,174 @@ contains
     return
 
   end subroutine timing
+
+  subroutine parse_args(infile, infield, sdevs, vol, ok)
+    implicit none
+    character(len=*), intent(out) :: infile, infield
+    integer(ik), intent(out)      :: sdevs, vol
+    logical, intent(out)          :: ok
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    !Parse the command line into the input file, field name and thresholds.
+    !Recognises -f/--file, -n/--field, -s/--sdevs, -v/--volume and -h/--help,
+    !plus the --key=value form. Returns ok=.false. on help or any error.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    integer             :: nargs, iarg, ios, eqpos
+    character(len=1024) :: arg, key, val
+    logical             :: have_file, have_field
+
+    ! Defaults.
+    infile     = ''
+    infield    = ''
+    sdevs      = 3_ik
+    vol        = 0_ik
+    have_file  = .false.
+    have_field = .false.
+    ok         = .true.
+
+    nargs = command_argument_count()
+    if(nargs == 0) then
+       call print_usage
+       ok = .false.
+       return
+    end if
+
+    iarg = 1
+    do while(iarg <= nargs)
+       call get_command_argument(iarg, arg)
+
+       ! Split a --key=value argument; otherwise the value (if any) is the
+       ! following argument.
+       eqpos = index(arg, '=')
+       if(arg(1:2) == '--' .and. eqpos > 0) then
+          key = arg(1:eqpos-1)
+          val = arg(eqpos+1:)
+       else
+          key = arg
+          val = ''
+       end if
+
+       select case(trim(key))
+       case('-h', '--help')
+          call print_usage
+          ok = .false.
+          return
+
+       case('-f', '--file')
+          call take_value(iarg, nargs, key, val, ok)
+          if(.not. ok) return
+          infile = val
+          have_file = .true.
+
+       case('-n', '--field')
+          call take_value(iarg, nargs, key, val, ok)
+          if(.not. ok) return
+          infield = val
+          have_field = .true.
+
+       case('-s', '--sdevs')
+          call take_value(iarg, nargs, key, val, ok)
+          if(.not. ok) return
+          read(val, *, iostat=ios) sdevs
+          if(ios /= 0) then
+             print '(3a)', 'error: ', trim(key), ' expects an integer.'
+             ok = .false.
+             return
+          end if
+
+       case('-v', '--volume')
+          call take_value(iarg, nargs, key, val, ok)
+          if(.not. ok) return
+          read(val, *, iostat=ios) vol
+          if(ios /= 0) then
+             print '(3a)', 'error: ', trim(key), ' expects an integer.'
+             ok = .false.
+             return
+          end if
+
+       case default
+          print '(2a)', 'error: unknown argument: ', trim(arg)
+          print '(a)', "try 'exstruct.exe --help'"
+          ok = .false.
+          return
+       end select
+
+       iarg = iarg + 1
+    end do
+
+    ! Validate.
+    if(.not. have_file) then
+       print '(a)', 'error: no input file given (-f/--file).'
+       ok = .false.
+       return
+    end if
+
+    if(.not. have_field) then
+       print '(a)', 'error: no field name given (-n/--field).'
+       ok = .false.
+       return
+    end if
+
+    if(sdevs <= 0_ik) then
+       print '(a)', 'error: sdevs (-s/--sdevs) must be a positive integer.'
+       ok = .false.
+       return
+    end if
+
+    if(vol < 0_ik) then
+       print '(a)', 'error: volume (-v/--volume) must be non-negative.'
+       ok = .false.
+       return
+    end if
+
+    return
+
+  end subroutine parse_args
+
+  subroutine take_value(iarg, nargs, key, val, ok)
+    implicit none
+    integer, intent(inout)          :: iarg
+    integer, intent(in)             :: nargs
+    character(len=*), intent(in)    :: key
+    character(len=*), intent(inout) :: val
+    logical, intent(out)            :: ok
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    !Resolve the value for an option: either the text after '=' (already in
+    !val) or the next command-line argument, advancing iarg in that case.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    ok = .true.
+    if(len_trim(val) > 0) return
+    if(iarg >= nargs) then
+       print '(3a)', 'error: option ', trim(key), ' requires a value.'
+       ok = .false.
+       return
+    end if
+    iarg = iarg + 1
+    call get_command_argument(iarg, val)
+
+    return
+
+  end subroutine take_value
+
+  subroutine print_usage
+    implicit none
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    !Print a short usage/help message.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    print '(a)', 'exstruct - extract high-dissipation structures from an HDF5 field'
+    print '(a)', ''
+    print '(a)', 'usage: exstruct.exe -f FILE -n FIELD [-s SDEVS] [-v VOLUME]'
+    print '(a)', ''
+    print '(a)', 'required:'
+    print '(a)', '  -f, --file FILE     path to the input HDF5 file'
+    print '(a)', '  -n, --field FIELD   name of the 3D dataset to read'
+    print '(a)', ''
+    print '(a)', 'optional:'
+    print '(a)', '  -s, --sdevs N       threshold at mean + N*stddev (positive int, default 3)'
+    print '(a)', '  -v, --volume N      output only structures with more than N points (default 0)'
+    print '(a)', '  -h, --help          show this help and exit'
+
+    return
+
+  end subroutine print_usage
 
 end program exstruct
