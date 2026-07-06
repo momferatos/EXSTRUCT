@@ -22,14 +22,21 @@ module types
   integer, parameter     :: cks = rks!complex type for arrays
   integer(ik), parameter :: inrk = sp
   integer(ik), parameter :: outrk = dp
+  ! Structure coordinates are stored as integer(i2b), and the periodic
+  ! unwrapping in translate_structures can push them up to twice the grid
+  ! extent, so each axis is limited to huge(i2b)/2 = 16383 points.
+  integer(ik), parameter :: max_extent = (huge(0_i2b) - 1) / 2
   integer(ik)            :: nnintrv
 
   type :: interval
      !!!!!!!!!!!!!!!!!!!
      !Interval data type
      !!!!!!!!!!!!!!!!!!!
-     integer(i2b), dimension(1:2) :: limits 
-     integer(i2b)                 :: i, j, k
+     ! Default-initialise the payload: consumers treat zero limits/indices as
+     ! "skip this node", so a freshly allocated node must never carry
+     ! undefined values (allocate does not zero memory).
+     integer(i2b), dimension(1:2) :: limits = 0
+     integer(i2b)                 :: i = 0, j = 0, k = 0
      type(interval), pointer      :: next => null()
   end type interval
 
@@ -43,7 +50,7 @@ module types
      logical                                   :: crosses_j = .false.
      logical                                   :: crosses_k = .false.
      type(structure), pointer                  :: next => null()
-     integer(i8b)                              :: npoints
+     integer(i8b)                              :: npoints = 0
      integer(i2b), dimension(:,:), allocatable :: points
   end type structure
 
@@ -63,14 +70,13 @@ module data
   !!!!!!!!!!!!!!!!!!!!!!!!
   !Wrapper module for data
   !!!!!!!!!!!!!!!!!!!!!!!!
-  integer(ik)                                   :: nnn
   integer(ik)                                   :: VOLUME
   integer(ik)                                   :: n1,n2,n3,n4,nstruct
   integer(i2b), dimension(:,:),allocatable      :: neigh
   real(rk), dimension(:,:,:), allocatable       :: field
   integer(i2b), dimension(:,:,:,:), allocatable :: intrv
   integer(ik), dimension(:,:),allocatable       :: nintrv
-  logical, dimension(:,:,:), allocatable        :: cintrv,rintrv
+  logical, dimension(:,:,:), allocatable        :: cintrv
   logical, dimension(:,:,:), allocatable        :: mask,refmask
   type(structure), target                       :: struct
   type(interval), pointer                       :: intrv_ptr => null()
@@ -165,9 +171,12 @@ contains
   subroutine check
     implicit none
     integer(ik) :: n,m,i,j,k
+    integer(ik) :: nerr
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     !Check consistency of structures with initial mask
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+    nerr = 0
 
     !$omp workshare
     mask = .false.
@@ -176,13 +185,21 @@ contains
     struct_ptr => struct
     n = 0
 
-    do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
+    ! .and. does not short-circuit in Fortran: the struct_ptr%... operand may
+    ! be evaluated even when struct_ptr is disassociated, which dereferences a
+    ! null pointer. Test the component separately inside the loop (everywhere
+    ! the list is walked).
+    do while(associated(struct_ptr))
+       if(.not.allocated(struct_ptr%points)) exit
        n = n + 1
        do m=1,struct_ptr%npoints
           i = struct_ptr%points(m,1)
           j = struct_ptr%points(m,2)
           k = struct_ptr%points(m,3)
-          if(mask(i,j,k)) print '(a,3i5)', 'error: double point ', i,j,k
+          if(mask(i,j,k)) then
+             print '(a,3i5)', 'error: double point ', i,j,k
+             nerr = nerr + 1
+          end if
           mask(i,j,k) = .true.
        end do
        struct_ptr => struct_ptr%next
@@ -193,16 +210,23 @@ contains
           do i=1,n1
              if(mask(i,j,k) .and. .not.refmask(i,j,k)) then
                 print '(a,3i5)', 'error: extra point ',i,j,k
+                nerr = nerr + 1
              end if
 
              if(.not.mask(i,j,k) .and. refmask(i,j,k)) then
                 print '(a,3i5)', 'error: missing point ',i,j,k
+                nerr = nerr + 1
              end if
           end do
        end do
     end do
 
-    return         
+    if(nerr /= 0) then
+       print '(a,i0,a)', 'check: ', nerr, ' inconsistent points.'
+       error stop 'error: structure extraction failed the self-check.'
+    end if
+
+    return
 
   end subroutine check
 
@@ -210,7 +234,7 @@ contains
     use types
     implicit none
     integer(ik),intent(IN)                       :: n1,n2,n3
-    integer(i2b), dimension(1:n1,1:n2,1:n3/2,2)  :: intrv
+    integer(i2b), dimension(1:n1,1:n2,1:(n3+1)/2,2)  :: intrv
     integer(ik), dimension(1:n1,1:n2)            :: nintrv
 !!!!!!!!!!!!!!!!!
     !Set-up intervals
@@ -220,7 +244,7 @@ contains
     integer(i2b), dimension(:,:,:,:),allocatable :: intrv1
     integer(i2b), dimension(:,:),allocatable     :: nintrv1
 
-    allocate(intrv1(n1,n2,n3/2,2))
+    allocate(intrv1(n1,n2,(n3+1)/2,2))
     allocate(nintrv1(n1,n2))
     nnintrv = 0
     nintrv1 = 0
@@ -286,24 +310,31 @@ contains
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     !Top-level routine for structure identification
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    integer(ik)                                  :: i,j,k,start,end
+    integer(ik)                                  :: i,j,k
     type(interval)                               :: intrv1
-    type(structure), allocatable, dimension(:,:) :: structarr
 
     n4 = maxval(nintrv)
-    allocate(cintrv(n1,n2,n4),rintrv(n1,n2,n4))
+    allocate(cintrv(n1,n2,n4))
     cintrv(:,:,:) = .false.
-    rintrv(:,:,:) = .false.
     nstruct = 0
-    struct_ptr => struct
-    allocate(struct%intrv)
-    intrv_ptr => struct%intrv
-    struct_ptr%nintrv = 0
+    nullify(struct_ptr)
 
     do j=1,n2
        do i=1,n1
           do k=1,nintrv(i,j)
              if(.not.cintrv(i,j,k)) then
+                ! Open a structure node only once a new structure is seeded.
+                ! The old pre-allocated tail node showed up downstream as a
+                ! phantom zero-volume structure: it inflated the structure
+                ! count by one, forced the minimum volume to 0 and appended a
+                ! bogus 0 record to gs.dat.
+                if(.not.associated(struct_ptr)) then
+                   struct_ptr => struct
+                else
+                   allocate(struct_ptr%next)
+                   struct_ptr => struct_ptr%next
+                end if
+                nstruct = nstruct + 1
                 intrv1%limits(1) = intrv(i,j,k,1)
                 intrv1%limits(2) = intrv(i,j,k,2)
                 intrv1%i = i
@@ -311,12 +342,6 @@ contains
                 intrv1%k = k
                 call find_neighbours(intrv1)
                 cintrv(i,j,k) = .true.
-                allocate(struct_ptr%next)
-                struct_ptr => struct_ptr%next
-                nullify(struct_ptr%next)
-                nstruct = nstruct + 1
-                allocate(struct_ptr%intrv)
-                intrv_ptr => struct_ptr%intrv
              end if
           end do
        end do
@@ -327,7 +352,7 @@ contains
   end subroutine find_structures
 
   subroutine find_neighbours(intrv1)
-    use data,only:cintrv,rintrv,nintrv,intrv_ptr,struct_ptr,neigh
+    use data,only:cintrv,nintrv,intrv_ptr,struct_ptr,neigh
     use types
     implicit none
     type(interval), intent(INOUT) :: intrv1
@@ -405,17 +430,17 @@ contains
 
       if(first<last) then
          first = first + 1
+         ! Queue entries are written by sub2 before they are ever popped and
+         ! always hold valid 1-based indices, so they can be used directly.
          ii = neigh(first,1)
          jj = neigh(first,2)
          kk = neigh(first,3)
-         if(ii /= 0 .and. jj /= 0 .and. kk /= 0) then
-            intrv1%limits(1) = intrv(ii,jj,kk,1)
-            intrv1%limits(2) = intrv(ii,jj,kk,2)
-            intrv1%i = ii
-            intrv1%j = jj
-            intrv1%k = kk
-            lcond = .true.
-         end if
+         intrv1%limits(1) = intrv(ii,jj,kk,1)
+         intrv1%limits(2) = intrv(ii,jj,kk,2)
+         intrv1%i = ii
+         intrv1%j = jj
+         intrv1%k = kk
+         lcond = .true.
          lcycle = .true.
       else
          lexit = .true.
@@ -428,17 +453,9 @@ contains
     subroutine sub2
       implicit none
 
-      !rintrv(i,j,k) = .true.
       if(.not.cintrv(i,j,k)) then
-         intrv_ptr%limits(1) = intrv(i,j,k,1)
-         intrv_ptr%limits(2) = intrv(i,j,k,2)
-         intrv_ptr%i = i
-         intrv_ptr%j = j
-         intrv_ptr%k = k
+         call append_interval(i, j, k)
          struct_ptr%nintrv = struct_ptr%nintrv + 1
-         allocate(intrv_ptr%next)
-         intrv_ptr => intrv_ptr%next
-         nullify(intrv_ptr%next)
          cintrv(i,j,k) = .true.
       end if
 
@@ -512,15 +529,7 @@ contains
                   struct_ptr%crosses_k = .true.
                end if
 
-               intrv_ptr%limits(1) = intrv(ii,jj,kk,1)
-               intrv_ptr%limits(2) = intrv(ii,jj,kk,2)
-
-               intrv_ptr%i = ii
-               intrv_ptr%j = jj
-               intrv_ptr%k = kk
-               allocate(intrv_ptr%next)
-               intrv_ptr => intrv_ptr%next
-               nullify(intrv_ptr%next)
+               call append_interval(ii, jj, kk)
                cintrv(ii,jj,kk) = .true.
 
                last = last + 1
@@ -536,6 +545,34 @@ contains
 
     end subroutine sub2
 
+    subroutine append_interval(ai, aj, ak)
+      implicit none
+      integer(ik), intent(in) :: ai, aj, ak
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+      !Append the interval at (ai,aj,ak) to the current structure's list.
+      !The node is allocated only here, together with its data: allocating
+      !ahead of the data (as the old code did) left a trailing node with
+      !undefined limits on every structure.
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+      if(.not.associated(struct_ptr%intrv)) then
+         allocate(struct_ptr%intrv)
+         intrv_ptr => struct_ptr%intrv
+      else
+         allocate(intrv_ptr%next)
+         intrv_ptr => intrv_ptr%next
+      end if
+
+      intrv_ptr%limits(1) = intrv(ai,aj,ak,1)
+      intrv_ptr%limits(2) = intrv(ai,aj,ak,2)
+      intrv_ptr%i = ai
+      intrv_ptr%j = aj
+      intrv_ptr%k = ak
+
+      return
+
+    end subroutine append_interval
+
   end subroutine find_neighbours
 
   function is_neighbour(i1,i2)
@@ -546,7 +583,6 @@ contains
     !Check whether two intervals are neighbours
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     logical                               :: is_neighbour
-    integer(ik)                           :: start1,start2,end1,end2
     integer                               :: a,b,x,y
     integer                               :: nn3
 
@@ -596,13 +632,14 @@ contains
 !!!!!!!!!!!!!!!!!!!!!!!!
     !Write strucures to file
 !!!!!!!!!!!!!!!!!!!!!!!!
-    integer(ik)    :: n,i,j,k,nfile,m
+    integer(ik)    :: nfile
     character(128) :: filename
 
     nfile = 0
     struct_ptr => struct
 
-    do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
+    do while(associated(struct_ptr))
+       if(.not.allocated(struct_ptr%points)) exit
        if(struct_ptr%npoints > VOLUME) then
           write(filename,'(a,i0,a)') 'out.',nfile,'.vtk'
           call write_vtk_file(trim(filename),struct_ptr)
@@ -611,7 +648,7 @@ contains
        struct_ptr => struct_ptr%next
     end do
 
-    print '(a,i4,a)', 'Wrote ', nfile, ' files.'
+    print '(a,i0,a)', 'Wrote ', nfile, ' files.'
 
     return
 
@@ -625,8 +662,7 @@ contains
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     !Write vtk file for individual structure
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    integer(ik)              :: i,j,k,m,vtk_file = 999
-    integer(ik)              :: tmp
+    integer(ik)              :: m,vtk_file = 999
     real(rk)                 :: x,y,z
 
     open(vtk_file,file=filename,form='formatted',action='write')
@@ -643,6 +679,15 @@ contains
        y = struct_ptr%points(m,5)
        z = struct_ptr%points(m,6)
        write(vtk_file,'(t1,3e19.8)') x,y,z
+    end do
+
+    ! POLYDATA with bare POINTS has no cells, and viewers such as ParaView
+    ! render it as empty: emit one VERTEX cell per point (cell list size is
+    ! 2*npoints: a count and a 0-based point index per cell).
+    write(vtk_file, '(t1,a,i0,a,i0)') 'VERTICES ', struct_ptr%npoints, &
+         ' ', 2 * struct_ptr%npoints
+    do m=1,struct_ptr%npoints
+       write(vtk_file,'(t1,a,i0)') '1 ', m - 1
     end do
 
     close(vtk_file,status='keep')
@@ -665,7 +710,8 @@ contains
     struct_ptr => struct
 
     n = 0
-    do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
+    do while(associated(struct_ptr))
+       if(.not.allocated(struct_ptr%points)) exit
        n = n + 1
        !$omp workshare
        box(:,:,:) = .false.
@@ -732,12 +778,16 @@ contains
       logical :: connected,cell
       integer(ik) :: i,j,ii,jj,iii,jjj
 
+      ! reduction(.or.:connected): every thread used to write the shared flag
+      ! unsynchronised (a data race). With the reduction each thread works on
+      ! a private copy, and 'if(connected) cycle' short-circuits only that
+      ! thread's own remaining iterations.
       connected = .false.
 
       if(dim==1_ik) then
          ! i-face: does the box(1,:,:) plane connect to box(n1,:,:)?
          ! scan the (n2,n3) plane and wrap neighbours by n2,n3.
-         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) reduction(.or.:connected)
          do i=1,n2
             if(connected) cycle
             do j=1,n3
@@ -760,7 +810,7 @@ contains
       else if(dim==2_ik) then
          ! j-face: does box(:,1,:) connect to box(:,n2,:)?
          ! scan the (n1,n3) plane and wrap neighbours by n1,n3.
-         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) reduction(.or.:connected)
          do i=1,n1
             if(connected) cycle
             do j=1,n3
@@ -783,7 +833,7 @@ contains
       else if(dim==3_ik) then
          ! k-face: does box(:,:,1) connect to box(:,:,n3)?
          ! scan the (n1,n2) plane and wrap neighbours by n1,n2.
-         !$omp parallel do private(j,ii,jj,iii,jjj,cell) shared(connected)
+         !$omp parallel do private(j,ii,jj,iii,jjj,cell) reduction(.or.:connected)
          do i=1,n1
             if(connected) cycle
             do j=1,n2
@@ -834,7 +884,6 @@ contains
     integer(HID_T) :: file_id       ! File identifier
     integer(HID_T) :: dset_id       ! Dataset identifier
     integer(HID_T) :: space_id       ! Dataspace identifier
-    integer(HID_T) :: dtype_id       ! Dataspace identifier
     integer     ::   error ! Error flag
     integer        :: rank
     integer(HSIZE_T), dimension(3) :: data_dims
@@ -845,26 +894,38 @@ contains
     ! Initialize FORTRAN interface.
 
     call h5open_f(error)
-    if(error < 0) stop 'error: could not initialise the HDF5 interface.'
+    if(error < 0) then
+       print '(a)', 'error: could not initialise the HDF5 interface.'
+       stop 1
+    end if
 
     ! Open an existing file read-only (we never write to it).
 
     call h5fopen_f (trim(filename), H5F_ACC_RDONLY_F, file_id, error)
-    if(error < 0) stop 'error: could not open the HDF5 file (check the path).'
+    if(error < 0) then
+       print '(a)', 'error: could not open the HDF5 file (check the path).'
+       stop 1
+    end if
 
     ! Open an existing dataset. trim() is essential: a blank-padded name does
     ! not match the dataset and h5dopen_f then leaves field uninitialised, so
     ! the structures would be extracted from garbage.
 
     call h5dopen_f(file_id, trim(fieldname), dset_id, error)
-    if(error < 0) stop 'error: could not open the requested field (check fieldname).'
+    if(error < 0) then
+       print '(a)', 'error: could not open the requested field (check fieldname).'
+       stop 1
+    end if
 
     !Get dataspace ID
     call h5dget_space_f(dset_id, space_id,error)
 
     ! Reject anything that is not a 3D dataset rather than reading it scrambled.
     call h5sget_simple_extent_ndims_f(space_id, rank, error)
-    if(error < 0 .or. rank /= 3) stop 'error: the field dataset is not 3-dimensional.'
+    if(error < 0 .or. rank /= 3) then
+       print '(a)', 'error: the field dataset is not 3-dimensional.'
+       stop 1
+    end if
 
     !Get dataspace dims
 
@@ -874,12 +935,23 @@ contains
     n2 = data_dims(2)
     n3 = data_dims(3)
 
+    ! Refuse grids the 16-bit coordinate storage cannot represent, instead of
+    ! overflowing silently (see max_extent in the types module).
+    if(max(n1, n2, n3) > max_extent) then
+       print '(a,i0,a)', 'error: grid dimensions above ', max_extent, &
+            ' are not supported (coordinates are stored as 16-bit integers).'
+       stop 1
+    end if
+
     !Allocate dimensions to dset_data for reading
     allocate(field(n1, n2, n3))
 
     !Get data
     call h5dread_f(dset_id, H5T_NATIVE_REAL, field, data_dims, error)
-    if(error < 0) stop 'error: could not read the field data.'
+    if(error < 0) then
+       print '(a)', 'error: could not read the field data.'
+       stop 1
+    end if
 
     ! Close the dataspace, dataset and file before closing the interface,
     ! otherwise these handles leak.
@@ -898,7 +970,7 @@ end module routines
 program exstruct
   use types
   use routines
-  use data,only:nnn
+  use data
   implicit none
 !!!!!!!!!!!!!
   !Main program
@@ -906,27 +978,27 @@ program exstruct
   real(rk)                               :: mean,sdev
   integer(ik)                            :: m = 3
   type(interval), pointer                :: intrv_ptr2
-  type(structure),pointer                :: struct_ptr2
-  integer(ik)                            :: i,j,k,vol,k1,k2,maxvol,minvol,n
-  integer(ik)                            :: kk,none,which,nppdf,nstruct2
-  real(rk)                               :: t1,t2,tmp,totohm,totad,totvisc
-  real(rk)                               :: sohm,svisc,sad,tottot,stot,svol
-  character(256)                         :: path,fmt
+  integer(ik)                            :: i,j,k,vol,k1,k2,maxvol,minvol
+  integer(ik)                            :: kk
+  real(dp)                               :: t1,t2
   real(8), external                      :: omp_get_wtime
-  integer(i2b),  dimension(:,:), pointer :: point_array
   character(len=1024)                    :: fname, field_name
   logical                                :: args_ok
+  logical                                :: check_failed
 
   call parse_args(fname, field_name, m, volume, args_ok)
-  if(.not. args_ok) stop
+  ! 'stop' with a message string exits with status 0, so every error path
+  ! here uses 'stop 1' (user error) or 'error stop' (failed self-check)
+  ! instead: scripts must be able to detect a failed run.
+  if(.not. args_ok) stop 1
 
   call read_hdf5_file(n1,n2,n3,field,fname,field_name)
 
   ! Worst case the BFS queue holds every interval; intrv() caps each column at
-  ! n3/2 intervals, so this bound is valid for non-cubic grids too (and is
-  ! smaller than the old n1**3 for cubic ones).
-  allocate(neigh(n1 * n2 * (n3 / 2), 3))
-  neigh = 0
+  ! (n3+1)/2 intervals (an alternating column holds ceil(n3/2) of them, one
+  ! more than n3/2 when n3 is odd), so this bound is valid for non-cubic grids
+  ! too (and is smaller than the old n1**3 for cubic ones).
+  allocate(neigh(n1 * n2 * ((n3 + 1) / 2), 3))
   allocate(mask(n1,n2,n3))
 
   !$omp workshare
@@ -936,11 +1008,11 @@ program exstruct
   !$omp workshare
   refmask = .false.
   !$omp end workshare
-  allocate(intrv(n1,n2,n3/2,2))
+  allocate(intrv(n1,n2,(n3+1)/2,2))
   allocate(nintrv(n1,n2))
 
   !$omp parallel do
-  do k=1,n3/2
+  do k=1,(n3+1)/2
      do j=1,n2
         do i=1,n1
            intrv(i,j,k,:) = 0_ik
@@ -979,6 +1051,7 @@ program exstruct
   mask = .false.
   !$omp end workshare
   
+  check_failed = .false.
   do i=1,n1
      do j=1,n2
         do kk=1,nintrv(i,j)
@@ -986,16 +1059,25 @@ program exstruct
            k2 = intrv(i,j,kk,2)
            if(k1 <= k2) then
               do k=k1,k2
-                 if(mask(i,j,k)) print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                 if(mask(i,j,k)) then
+                    print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                    check_failed = .true.
+                 end if
                  mask(i,j,k) = .true.
               end do
            else 
               do k=k1,n3
-                 if(mask(i,j,k)) print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                 if(mask(i,j,k)) then
+                    print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                    check_failed = .true.
+                 end if
                  mask(i,j,k) = .true.
               end do
               do k=1,k2
-                 if(mask(i,j,k)) print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                 if(mask(i,j,k)) then
+                    print '(a,6i5)', 'error: double point ', i,j,k,k1,k2,nintrv(i,j)
+                    check_failed = .true.
+                 end if
                  mask(i,j,k) = .true.
               end do
            end if
@@ -1003,7 +1085,10 @@ program exstruct
      end do
   end do
 
-  if(all(mask.eqv.refmask)) print '(a)', 'Intervals ok.'
+  if(check_failed .or. .not.all(mask.eqv.refmask)) then
+     error stop 'error: the interval decomposition does not match the mask.'
+  end if
+  print '(a)', 'Intervals ok.'
 
   print '(a,i10)', 'intervals: ', sum(nintrv)
 
@@ -1018,15 +1103,14 @@ program exstruct
 
   deallocate(intrv)
   deallocate(cintrv)
-  deallocate(rintrv)
 
   struct_ptr => struct
   maxvol = 0
   minvol = 99999999
   nstruct = 0
-  n = 0
   nnintrv = 0
-  do while(associated(struct_ptr) .and. associated(struct_ptr%intrv))
+  do while(associated(struct_ptr))
+     if(.not.associated(struct_ptr%intrv)) exit
      intrv_ptr => struct_ptr%intrv
      nnintrv = nnintrv + struct_ptr%nintrv
      vol = 0
@@ -1062,23 +1146,22 @@ program exstruct
   !print *, nnintrv, sum(nintrv)
 
   struct_ptr => struct
-  vol = 0
   open(966,file='gs.dat')
-  do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
-     write(966,'(t1,i5)') struct_ptr%npoints
-     vol = vol + struct_ptr%npoints
+  do while(associated(struct_ptr))
+     if(.not.allocated(struct_ptr%points)) exit
+     ! i0, not a fixed width: structures beyond 99999 points would print as
+     ! '*****' and corrupt gs.dat for downstream scripts.
+     write(966,'(t1,i0)') struct_ptr%npoints
      struct_ptr => struct_ptr%next
   end do
 
   mask(:,:,:) = .false.
   nnintrv = 0
   struct_ptr => struct
-  n = 0
-  do while(associated(struct_ptr) .and. associated(struct_ptr%intrv))
-     n = n + 1
+  do while(associated(struct_ptr))
+     if(.not.associated(struct_ptr%intrv)) exit
      intrv_ptr => struct_ptr%intrv
      kk = 1
-     vol = 0
      do while(associated(intrv_ptr))
         if(any(intrv_ptr%limits==0)) then
            intrv_ptr => intrv_ptr%next
@@ -1091,36 +1174,30 @@ program exstruct
         if(i /= 0 .and. j /= 0 .and. k1 /= 0 .and. k2 /= 0) then
            if(k1 <= k2) then
               do k=k1,k2
-                 if(i /= 0 .and. j /= 0 .and. k /= 0 .and. .not.mask(i,j,k)) then
+                 if(.not.mask(i,j,k)) then
                     struct_ptr%points(kk,1) = i
                     struct_ptr%points(kk,2) = j
                     struct_ptr%points(kk,3) = k
                     kk = kk + 1
-                    vol = vol + 1
-                    if(mask(i,j,k)) print '(a,4i5)', 'error: double point ',i,j,k,n
                     mask(i,j,k) = .true.
                  end if
               end do
-           else 
+           else
               do k=k1,n3
-                 if(i /= 0 .and. j /= 0 .and. k /= 0 .and. .not.mask(i,j,k)) then
+                 if(.not.mask(i,j,k)) then
                     struct_ptr%points(kk,1) = i
                     struct_ptr%points(kk,2) = j
                     struct_ptr%points(kk,3) = k
                     kk = kk + 1
-                    vol = vol + 1
-                    if(mask(i,j,k)) print '(a,4i5)','error: double point ', i,j,k,n
                     mask(i,j,k) = .true.
                  end if
               end do
               do k=1,k2
-                 if(i /= 0 .and. j /= 0 .and. k /= 0 .and. .not.mask(i,j,k)) then
+                 if(.not.mask(i,j,k)) then
                     struct_ptr%points(kk,1) = i
                     struct_ptr%points(kk,2) = j
                     struct_ptr%points(kk,3) = k
                     kk = kk + 1
-                    vol = vol + 1
-                    if(mask(i,j,k)) print '(a,4i5)','error: double point ', i,j,k,n
                     mask(i,j,k) = .true.
                  end if
               end do
@@ -1128,21 +1205,25 @@ program exstruct
         end if
         intrv_ptr => intrv_ptr%next
         nnintrv = nnintrv + 1
-        n = n + 1
      end do
+     ! Every point counted into npoints must have been recorded exactly once:
+     ! a shortfall would leave zero rows in points() and break check().
+     if(kk - 1 /= struct_ptr%npoints) then
+        error stop 'error: point count mismatch during extraction.'
+     end if
      struct_ptr => struct_ptr%next
   end do
 
   print '(a,i10)', 'nnintrv: ', nnintrv
 
   if(any(refmask.neqv.mask)) then
-     print '(a)', 'extraction error.'
-  else
-     print '(a)', 'extraction ok.'
+     error stop 'error: the extracted structures do not cover the mask.'
   end if
+  print '(a)', 'extraction ok.'
 
   struct_ptr => struct
-  do while(associated(struct_ptr) .and. associated(struct_ptr%intrv))
+  do while(associated(struct_ptr))
+     if(.not.associated(struct_ptr%intrv)) exit
      intrv_ptr => struct_ptr%intrv
      do while(associated(intrv_ptr))
         intrv_ptr2 => intrv_ptr
@@ -1163,9 +1244,11 @@ program exstruct
   print '(a)', 'ok'
 
   open(985,file='struct.bin',form='unformatted',action='write')
-  write(985) nstruct - 1
+  ! nstruct no longer includes the phantom tail node, so write it as is.
+  write(985) nstruct
   struct_ptr => struct
-  do while(associated(struct_ptr) .and. allocated(struct_ptr%points))
+  do while(associated(struct_ptr))
+     if(.not.allocated(struct_ptr%points)) exit
      if(struct_ptr%npoints /= 0) then
         write(985) struct_ptr%npoints
         write(985) struct_ptr%points(1:struct_ptr%npoints,1:3)
@@ -1183,12 +1266,14 @@ contains
 
   subroutine timing(t)
     implicit none
-    real(rk), intent(OUT) :: t
+    real(dp), intent(OUT) :: t
 
+    ! omp_get_wtime() is callable from serial code: the old parallel region
+    ! around it made every thread write the shared t concurrently. Double
+    ! precision, because wtime is seconds since an arbitrary epoch and a
+    ! single-precision difference of two large values loses the interval.
 #ifdef _OPENMP_
-    !$omp parallel
     t = omp_get_wtime()
-    !$omp end parallel
 #else
     call cpu_time(t)
 #endif
@@ -1244,9 +1329,10 @@ contains
 
        select case(trim(key))
        case('-h', '--help')
+          ! Help is a normal exit (status 0), unlike the error paths, which
+          ! must exit nonzero so scripts can detect them.
           call print_usage
-          ok = .false.
-          return
+          stop
 
        case('-f', '--file')
           call take_value(iarg, nargs, key, val, ok)
